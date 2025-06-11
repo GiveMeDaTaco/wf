@@ -1,133 +1,120 @@
-
-"""
-Script #2 — YAML‑driven Teradata waterfall builder
---------------------------------------------------
-
-Public function:
-
-    build_waterfall_tables(engine, yaml_path: str | Path, logger) -> List[str]
-
-* Validates YAML per the specification.
-* Generates CREATE TABLE AS … statements for each channel (base first).
-* Adds secondary indexes on the identifier (count) columns.
-* Executes each DDL via the supplied SQLAlchemy engine.
-* Returns the list of executed SQL strings (helpful for audit/tests).
-"""
-
+# yaml_waterfall_builder.py  (patched)
+# ---------------------------------------------------------------
 from __future__ import annotations
-import re, logging, yaml
+import re, yaml, logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 from sqlalchemy import Engine, text
 
-RE_OUTPUT = re.compile(r"^[A-Za-z_][\w\$#]*\.[A-Za-z_][\w\$#]*$")
+RE_OUTPUT = re.compile(r"^[A-Za-z_][\w$#]*\.[A-Za-z_][\w$#]*$")
 
-def _comma(cols: List[str]) -> str:
-    return ", ".join(cols)
+# ── helpers ────────────────────────────────────────────────────
+_comma   = lambda xs: ", ".join(xs)
+_is_id   = lambda s: re.match(r"^[A-Za-z_][\w$#]*$", s)
+_bare    = lambda s: s.split(".")[-1]          # strip a. → customer_id
 
-def _is_sql_identifier(name: str) -> bool:
-    return bool(re.match(r"^[A-Za-z_][\w\$#]*$", name))
-
-def _validate_yaml(doc: Dict[str, Any]):
+def _validate(doc: Dict[str, Any]) -> None:
     if "settings" not in doc or "tables" not in doc:
-        raise ValueError("YAML needs top‑level 'settings' and 'tables'.")
-    channels = [k for k in doc if k not in ("settings", "tables")]
-    if not channels or channels[0] != "base":
-        raise ValueError("First channel must be 'base'.")
-    for ch in channels:
-        if not _is_sql_identifier(ch):
-            raise ValueError(f"Illegal channel name '{ch}'.")
-        out = doc[ch].get("output")
-        if not (out and RE_OUTPUT.match(out)):
-            raise ValueError(f"Channel '{ch}': output must be 'schema.table'.")
-        for chk in doc[ch].get("checks", []):
-            if not chk.get("teradata_logic"):
-                raise ValueError(f"{ch}: every check needs 'teradata_logic'.")
-            if ch != "base" and not chk.get("template_id"):
-                raise ValueError(f"{ch}: non‑base checks need 'template_id'.")
-            if not chk.get("description", "").strip():
-                raise ValueError(f"{ch}: description cannot be empty.")
-    if sum(1 for t in doc["tables"].values() if t["join_type"].upper() == "FROM") != 1:
-        raise ValueError("Exactly one table must have join_type 'FROM'.")
+        raise ValueError("YAML must have top‑level 'settings' and 'tables'.")
+    chans = [k for k in doc if k not in ("settings", "tables")]
+    if not chans or chans[0] != "base":
+        raise ValueError("First channel must be literally 'base'.")
+    for ch in chans:
+        if not _is_id(ch):
+            raise ValueError(f"Illegal channel name {ch}")
+        if not RE_OUTPUT.match(doc[ch].get("output", "")):
+            raise ValueError(f"{ch}: output must be schema.table")
+        for ck in doc[ch].get("checks", []):
+            if not ck.get("teradata_logic"):
+                raise ValueError(f"{ch}: every check needs teradata_logic")
+            if ch != "base" and not ck.get("template_id"):
+                raise ValueError(f"{ch}: non‑base check missing template_id")
+            if not ck.get("description", "").strip():
+                raise ValueError(f"{ch}: description cannot be empty")
+    if sum(j["join_type"].upper() == "FROM" for j in doc["tables"].values()) != 1:
+        raise ValueError("Exactly one table must have join_type FROM")
 
-def build_waterfall_tables(engine: Engine, yaml_path: str | Path, logger: logging.Logger) -> List[str]:
+# ── main builder ───────────────────────────────────────────────
+def build_waterfall_tables(engine: Engine,
+                           yaml_path: str | Path,
+                           logger: logging.Logger) -> List[str]:
     doc = yaml.safe_load(Path(yaml_path).read_text())
-    _validate_yaml(doc)
+    _validate(doc)
 
-    settings = doc["settings"]
-    count_columns: List[str] = settings["count_columns"]
-    offer_code: str = settings["offer_code"]
-    ddl_executed: List[str] = []
+    settings      = doc["settings"]
+    id_cols       = settings["count_columns"]        # may include aliases
+    offer_code    = settings["offer_code"]
+    ddl_ran: List[str] = []
 
-    # Build the FROM / JOIN block once
-    tables_clause: List[str] = []
-    for tbl_key, info in doc["tables"].items():
-        jt = info["join_type"].upper()
-        alias = info["alias"]
-        if jt == "FROM":
-            tables_clause.append(f"FROM {tbl_key} {alias}")
-        else:
-            join_logic = info["join_logic"]
-            tables_clause.append(f"{jt} {tbl_key} {alias} ON {join_logic}")
-    from_sql = "\n    ".join(tables_clause)
+    # ---- 1.  keep table order exactly as in YAML -----------------
+    tables_items  = list(doc["tables"].items())
+    base_tbl_key, base_tbl_info = next((k, v) for k, v in tables_items
+                                       if v["join_type"].upper() == "FROM")
+    first_alias   = base_tbl_info["alias"]            # e.g. a
 
-    channels = [k for k in doc if k not in ("settings", "tables")]
+    # ---- 2.  pre‑compute base‑check aliases ----------------------
+    base_chk_aliases, per_tmpl_ctr = [], {}
+    for ck in doc["base"]["checks"]:
+        tmpl = ck.get("template_id", "BA")
+        per_tmpl_ctr[tmpl] = per_tmpl_ctr.get(tmpl, 0) + 1
+        base_chk_aliases.append(f"base_{tmpl}_{per_tmpl_ctr[tmpl]}")
 
-    for ch in channels:
-        info = doc[ch]
-        out_schema, _ = info["output"].split(".")
-        select_cols = _comma(count_columns)
-        select_checks: List[str] = []
-        templ_counter: Dict[str, int] = {}
-
-        for chk in info["checks"]:
-            templ = chk.get("template_id", "BA")
-            templ_counter[templ] = templ_counter.get(templ, 0) + 1
-            alias = f"{ch}_{templ}_{templ_counter[templ]}"
-            logic = chk["teradata_logic"]
-            select_checks.append(f"CASE WHEN {logic} THEN 1 ELSE 0 END AS {alias}")
-
-        select_list = ",\n               ".join([select_cols, *select_checks])
-
-        if ch == "base":
-            from_part = from_sql
-        else:
-            base_tbl = f"user_work.{offer_code}_base_waterfall"
-            # build list of base check aliases
-            tmp_ctr, base_aliases = {}, []
-            for chk in doc["base"]["checks"]:
-                templ = chk.get("template_id", "BA")
-                tmp_ctr[templ] = tmp_ctr.get(templ, 0) + 1
-                base_aliases.append(f"base_{templ}_{tmp_ctr[templ]}")
-            wf_subquery = (
-                "SELECT " + _comma([c.split(".")[-1] for c in count_columns]) +
-                f" FROM {base_tbl} WHERE " +
-                " AND ".join(f"{c}=1" for c in base_aliases)
+    # ---- 3.  iterate over channels (base first) ------------------
+    for ch in [k for k in doc if k not in ("settings", "tables")]:
+        info            = doc[ch]
+        out_schema, _   = info["output"].split(".")
+        # ---- select list ----------------------------------------
+        sel_cols   = _comma(id_cols)
+        tmpl_ctr   = {}
+        sel_checks = []
+        for ck in info["checks"]:
+            tmpl = ck.get("template_id", "BA")
+            tmpl_ctr[tmpl] = tmpl_ctr.get(tmpl, 0) + 1
+            alias = f"{ch}_{tmpl}_{tmpl_ctr[tmpl]}"
+            sel_checks.append(
+                f"CASE WHEN {ck['teradata_logic']} THEN 1 ELSE 0 END AS {alias}"
             )
-            first_alias = doc["tables"][next(iter(doc["tables"]))]["alias"]
+        select_list = ",\n               ".join([sel_cols, *sel_checks])
+
+        # ---- FROM/JOIN block ------------------------------------
+        lines = [f"FROM {base_tbl_key} {first_alias}"]
+        if ch != "base":                                     # add the filter join
+            id_names  = [_bare(c) for c in id_cols]
+            base_wf   = (
+                "SELECT " + _comma(id_names) +
+                f" FROM user_work.{offer_code}_base_waterfall " +
+                "WHERE " + " AND ".join(f"{c}=1" for c in base_chk_aliases)
+            )
             join_keys = " AND ".join(
-                f"{first_alias}.{c.split('.')[-1]} = base_wf.{c.split('.')[-1]}"
-                for c in count_columns
+                f"{first_alias}.{name} = base_wf.{name}" for name in id_names
             )
-            from_part = (
-                f"FROM (\n        {wf_subquery}\n    ) base_wf\n    " +
-                from_sql.replace("FROM ", f"INNER JOIN (") +
-                f" ON {join_keys}\n    )"
-            )
+            lines.append(f"INNER JOIN ({base_wf}) base_wf ON {join_keys}")
 
+        # remaining tables (skip the FROM table already used)
+        for key, meta in tables_items:
+            if key == base_tbl_key:           # already emitted
+                continue
+            jt   = meta["join_type"].upper()
+            ali  = meta["alias"]
+            oncl = meta["join_logic"]
+            lines.append(f"{jt} {key} {ali} ON {oncl}")
+
+        from_block = "\n    ".join(lines)
+
+        # ---- full DDL -------------------------------------------
         ddl = f"""CREATE MULTISET TABLE {out_schema}.{offer_code}_{ch}_waterfall AS (
             SELECT
                {select_list}
-            {from_part}
-        ) WITH DATA""".strip()
+            {from_block}
+        ) WITH DATA"""
+        idx = f"CREATE INDEX ({_comma([_bare(c) for c in id_cols])}) " \
+              f"ON {out_schema}.{offer_code}_{ch}_waterfall"
 
-        idx_stmt = f"CREATE INDEX ({_comma([c.split('.')[-1] for c in count_columns])}) ON {out_schema}.{offer_code}_{ch}_waterfall"
+        with engine.begin() as cx:
+            cx.execute(text(ddl))
+            cx.execute(text(idx))
+        logger.info("Created %s.%s",
+                    out_schema, f"{offer_code}_{ch}_waterfall")
+        ddl_ran += [ddl, idx]
 
-        with engine.begin() as conn:
-            conn.execute(text(ddl))
-            conn.execute(text(idx_stmt))
-
-        logger.info("Created table %s.%s", out_schema, f"{offer_code}_{ch}_waterfall")
-        ddl_executed.extend([ddl, idx_stmt])
-
-    return ddl_executed
+    return ddl_ran
