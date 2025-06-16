@@ -51,36 +51,19 @@ def preload_cache_from_history(
         print("No records to add to the cache. Exiting.")
         return
 
-    # --- THIS IS THE CORRECTED SECTION ---
-    # 2. Convert parsed records to a Polars DataFrame using explicit Series
-    # This is more robust and guarantees the correct dtypes, preventing the 'Object' type error.
-    
-    # Unzip the list of tuples into separate lists for each column
     columns_list, num_unique_list, unique_percentage_list = zip(*parsed_records)
 
-    # Create the DataFrame from explicitly typed Polars Series
     new_history_df = pl.DataFrame({
-        "dataset_name": pl.Series(
-            [historical_dataset_name] * len(columns_list), dtype=CACHE_SCHEMA["dataset_name"]
-        ),
-        "columns": pl.Series(
-            columns_list, dtype=CACHE_SCHEMA["columns"]
-        ),
-        "num_unique": pl.Series(
-            num_unique_list, dtype=CACHE_SCHEMA["num_unique"]
-        ),
-        "unique_percentage": pl.Series(
-            unique_percentage_list, dtype=CACHE_SCHEMA["unique_percentage"]
-        ),
+        "dataset_name": pl.Series([historical_dataset_name] * len(columns_list), dtype=CACHE_SCHEMA["dataset_name"]),
+        "columns": pl.Series(columns_list, dtype=CACHE_SCHEMA["columns"]),
+        "num_unique": pl.Series(num_unique_list, dtype=CACHE_SCHEMA["num_unique"]),
+        "unique_percentage": pl.Series(unique_percentage_list, dtype=CACHE_SCHEMA["unique_percentage"]),
     })
-    # --- END OF CORRECTION ---
 
     if os.path.exists(cache_path):
         print(f"Loading existing cache from: {cache_path}")
         existing_cache_df = pl.read_parquet(cache_path)
         combined_df = pl.concat([existing_cache_df, new_history_df])
-        
-        # Remove duplicates, keeping the data already in the cache
         final_df = combined_df.unique(subset=["dataset_name", "columns"], keep="first")
         num_added = len(final_df) - len(existing_cache_df)
         print(f"Added {num_added} new records to the existing cache.")
@@ -89,8 +72,22 @@ def preload_cache_from_history(
         final_df = new_history_df
         print(f"Added {len(final_df)} new records to the new cache.")
 
+    # --- ROBUSTNESS FIX ---
+    # Explicitly cast the 'columns' column to the correct type before saving.
+    # This guards against any previous operation (like .unique()) changing the dtype to Object.
+    print("\nSchema BEFORE final cast:")
+    print(final_df.schema)
+    
+    final_df = final_df.with_columns(
+        pl.col("columns").cast(CACHE_SCHEMA["columns"])
+    )
+    
+    print("\nSchema AFTER final cast (this will be written to disk):")
+    print(final_df.schema)
+    # --- END OF FIX ---
+
     final_df.write_parquet(cache_path)
-    print(f"Cache successfully saved to: {cache_path}")
+    print(f"\nCache successfully saved to: {cache_path}")
 
 # --- Example Usage ---
 if __name__ == "__main__":
