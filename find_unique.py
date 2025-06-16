@@ -1,193 +1,178 @@
 import polars as pl
 import itertools
 from typing import List, Tuple, Dict
+import os
+import time
+
+# Define the schema for the cache to ensure consistency
+CACHE_SCHEMA = {
+    "dataset_name": pl.Utf8,
+    "columns": pl.List(pl.Utf8),
+    "num_unique": pl.Int64,
+    "unique_percentage": pl.Float64,
+}
 
 def find_most_unique_column_combination_progressive(
     df: pl.DataFrame,
-    top_n_to_carry_over: int = 5
+    dataset_name: str,
+    top_n_to_carry_over: int = 5,
+    cache_path: str = "uniqueness_cache.parquet"
 ) -> Tuple[List[str], int]:
     """
     Identifies the unique combination of columns that makes the DataFrame most unique,
-    using a progressive filtering approach.
+    using a strict progressive filtering approach with a caching mechanism.
+
+    Subsequent rounds will ONLY check combinations that contain one of the top N
+    ranked combinations from the previous round. For example, if a top 2-column
+    combo is ['col_A', 'col_B'], the 3-column checks will only explore combinations
+    that include ['col_A', 'col_B'], such as ['col_A', 'col_B', 'col_C'].
 
     Args:
         df (pl.DataFrame): The input Polars DataFrame.
-        top_n_to_carry_over (int): The number of top-performing combinations
-                                   from the previous stage to carry over
-                                   as a requirement for the next stage.
+        dataset_name (str): A unique identifier for the dataset being analyzed.
+        top_n_to_carry_over (int): The number of top unique column combinations
+                                   (from the previous stage) to carry forward.
+        cache_path (str): The file path for the permanent cache file.
 
     Returns:
         Tuple[List[str], int]: A tuple containing:
             - List[str]: The list of column names that form the most unique combination.
             - int: The number of unique rows for that combination.
     """
-
     total_rows = df.height
     all_columns = df.columns
-    
-    best_combination_overall = []
-    max_unique_rows_overall = 0
 
-    # Stores combinations and their unique counts for the current iteration
-    # { frozenset(col_names): unique_count }
-    current_stage_results: Dict[frozenset, int] = {} 
+    # --- Caching Logic: Load and Prepare Cache ---
+    try:
+        cache_df = pl.read_parquet(cache_path)
+        # Ensure schema matches
+        for col, dtype in CACHE_SCHEMA.items():
+            if col not in cache_df.columns or cache_df[col].dtype != dtype:
+                 raise ValueError(f"Cache file at {cache_path} has an invalid schema.")
+    except FileNotFoundError:
+        cache_df = pl.DataFrame(CACHE_SCHEMA)
 
-    # Stores the top N combinations from the previous stage to filter the current stage
-    # This will be a list of frozensets
-    previous_stage_top_combinations: List[frozenset] = []
+    print(f"Loading cache for dataset '{dataset_name}'...")
+    existing_results: Dict[tuple, Tuple[int, float]] = {
+        tuple(row[0]): (row[1], row[2])
+        for row in cache_df.filter(pl.col("dataset_name") == dataset_name)
+        .select(["columns", "num_unique", "unique_percentage"])
+        .iter_rows()
+    }
+    print(f"Found {len(existing_results)} cached results for this dataset.")
+    # --- End Caching Logic ---
 
-    print(f"Starting unique key search for {len(all_columns)} columns, total rows: {total_rows}")
+    stage_results: List[Tuple[int, frozenset]] = []
+    overall_best_combination = []
+    overall_max_unique_rows = 0
 
     for r in range(1, len(all_columns) + 1):
-        print(f"\n--- Checking combinations of size {r} ---")
-        current_stage_results.clear() # Reset for the new stage
+        print(f"\n--- Checking combinations of length {r} ---")
+        current_stage_candidates: List[List[str]] = []
+        checked_combinations_this_stage: set[frozenset] = set()
+        new_cache_entries = []
 
-        # Determine the pool of columns to consider for this stage's combinations
-        # If it's the first stage (r=1), use all columns.
-        # Otherwise, use columns present in the top combinations from the previous stage.
-        pool_for_next_combinations = set()
         if r == 1:
-            pool_for_next_combinations = set(all_columns)
-        elif previous_stage_top_combinations:
-            for combo_set in previous_stage_top_combinations:
-                pool_for_next_combinations.update(combo_set)
+            # For the first round, all columns are candidates
+            current_stage_candidates = [[col] for col in all_columns]
+        else:
+            # **Strict Candidate Generation**
+            # Build new combinations exclusively from the top performers of the previous round.
+            # For each top combination, extend it by adding one new column.
+            for _, prev_combo_frozenset in stage_results:
+                for col in all_columns:
+                    if col not in prev_combo_frozenset:
+                        new_combo = sorted(list(prev_combo_frozenset) + [col])
+                        new_combo_frozenset = frozenset(new_combo)
+                        if new_combo_frozenset not in checked_combinations_this_stage:
+                            current_stage_candidates.append(new_combo)
+                            checked_combinations_this_stage.add(new_combo_frozenset)
         
-        # If the pool is empty (e.g., no top combos from previous stage), break
-        if not pool_for_next_combinations and r > 1:
-            print(f"No suitable columns from previous stage to form combinations of size {r}. Stopping.")
+        # If no candidates could be generated (e.g., if top_n pruned everything),
+        # the loop will naturally stop as current_stage_candidates will be empty.
+
+        current_stage_metrics = []
+        hits_from_cache = 0
+        for combo_names_list in current_stage_candidates:
+            combo_key = tuple(sorted(combo_names_list))
+
+            if combo_key in existing_results:
+                num_unique, _ = existing_results[combo_key]
+                hits_from_cache += 1
+            else:
+                num_unique = df.select(pl.struct(combo_key).n_unique()).item()
+                unique_percentage = num_unique / total_rows if total_rows > 0 else 0.0
+                new_cache_entries.append(
+                    (dataset_name, list(combo_key), num_unique, unique_percentage)
+                )
+                existing_results[combo_key] = (num_unique, unique_percentage)
+
+            current_stage_metrics.append((num_unique, frozenset(combo_key)))
+
+            if num_unique > overall_max_unique_rows:
+                overall_max_unique_rows = num_unique
+                overall_best_combination = list(combo_key)
+
+            if overall_max_unique_rows == total_rows:
+                break
+
+        print(f"Processed {len(current_stage_candidates)} combinations. ({hits_from_cache} from cache)")
+
+        if new_cache_entries:
+            print(f"Adding {len(new_cache_entries)} new results to cache...")
+            new_rows_df = pl.DataFrame(new_cache_entries, schema=CACHE_SCHEMA)
+            cache_df = pl.concat([cache_df, new_rows_df])
+            cache_df.write_parquet(cache_path)
+            print("Cache saved to disk.")
+
+        if overall_max_unique_rows == total_rows:
+            print("\nFound a combination that uniquely identifies all rows.")
+            return overall_best_combination, overall_max_unique_rows
+
+        current_stage_metrics.sort(key=lambda x: x[0], reverse=True)
+        stage_results = current_stage_metrics[:top_n_to_carry_over]
+        
+        if not stage_results:
+            # If no combinations were good enough to carry over, we can't build the next round.
+            print("\nStopping early as no further improvements were found in the top N candidates.")
             break
 
-        # Generate combinations for the current stage
-        # We need to iterate over all_columns, not just pool_for_next_combinations
-        # to ensure new columns can be introduced, but then filter based on the previous stage's best.
-        
-        # For r=1, we check all single columns.
-        # For r>1, we generate combinations from `all_columns` and then apply the filter.
-        
-        # Iterate over ALL possible combinations of size `r` from `all_columns`
-        # Then, apply the filtering logic.
-        
-        candidate_combinations = itertools.combinations(all_columns, r)
-        
-        # Filtering: For r > 1, ensure at least one column from a previous top combo is present
-        # This is where the progressive pruning logic is applied.
-        filtered_candidate_combinations = []
-        if r == 1:
-            filtered_candidate_combinations = [combo for combo in candidate_combinations]
-        else:
-            for combo in candidate_combinations:
-                combo_set = frozenset(combo)
-                # Check if this combination contains AT LEAST ONE column from ANY of the
-                # top_n_to_carry_over combinations from the previous stage.
-                # This is a less strict requirement than requiring the *entire* previous top combo.
-                # A more strict requirement (e.g., must contain a *specific* previous top combo)
-                # might prune too aggressively.
-                
-                # Check if any part of the current combo overlaps with ANY previous_stage_top_combination
-                if any(col in prev_combo_set for col in combo_set for prev_combo_set in previous_stage_top_combinations):
-                     filtered_candidate_combinations.append(combo)
-
-        # If no candidates after filtering, we can stop
-        if not filtered_candidate_combinations and r > 1:
-            print(f"No filtered candidate combinations for size {r}. Stopping.")
-            break
-
-        current_stage_count = 0
-        for combo_names in filtered_candidate_combinations:
-            current_stage_count += 1
-            combo_names_list = list(combo_names)
-            
-            # Efficiently calculate n_unique
-            num_unique = df.select(pl.struct(combo_names_list).n_unique()).item()
-            
-            current_stage_results[frozenset(combo_names_list)] = num_unique
-
-            if num_unique > max_unique_rows_overall:
-                max_unique_rows_overall = num_unique
-                best_combination_overall = combo_names_list
-                print(f"  New best found: {best_combination_overall} -> {max_unique_rows_overall} unique rows")
-
-            if max_unique_rows_overall == total_rows:
-                print(f"  Found a perfect unique key: {best_combination_overall}. Stopping early.")
-                return best_combination_overall, max_unique_rows_overall
-        
-        print(f"  Processed {current_stage_count} candidate combinations for size {r}.")
-
-        # Identify top N for the next stage based on current stage results
-        sorted_current_stage_results = sorted(
-            current_stage_results.items(), key=lambda item: item[1], reverse=True
-        )
-        
-        previous_stage_top_combinations = [
-            combo_set for combo_set, _ in sorted_current_stage_results[:top_n_to_carry_over]
-        ]
-        
-        if previous_stage_top_combinations:
-            print(f"  Top {len(previous_stage_top_combinations)} combinations for next stage from size {r}:")
-            for combo_set in previous_stage_top_combinations:
-                print(f"    - {list(combo_set)} (Unique: {current_stage_results[combo_set]})")
-        else:
-            print(f"  No top combinations to carry over for size {r}. Next stage might be limited.")
-            # If no top combinations, the loop will likely break in the next iteration due to empty pool
-
-    return best_combination_overall, max_unique_rows_overall
+    return overall_best_combination, overall_max_unique_rows
 
 # --- Example Usage ---
 if __name__ == "__main__":
-    # Create a sample Polars DataFrame with 25 columns and some redundancy
-    data = {f"col_{i}": [j % (i + 1) for j in range(1000)] for i in range(1, 26)}
-    # Add a column that makes some combinations more unique
-    data["id_base"] = [i for i in range(1000)]
-    data["name_base"] = [f"Name_{i}" for i in range(1000)]
+    # Create a sample Polars DataFrame
+    data = {
+        "id": [1, 1, 2, 3, 3, 4],
+        "name": ["Alice", "Alice", "Bob", "Charlie", "Charlie", "David"],
+        "city": ["NY", "LA", "NY", "SF", "SF", "LA"],
+        "age": [25, 25, 30, 35, 36, 40],
+        "zip": ["10001", "90210", "10001", "94105", "94105", "90210"]
+    }
+    df = pl.DataFrame(data)
     
-    # Introduce some non-unique elements
-    data["col_1"][0] = data["col_1"][1] # Duplicate first two values
-    data["name_base"][500] = data["name_base"][501] # Duplicate
+    # --- DEMONSTRATION OF CACHING AND STRICT PROGRESSION ---
+    CACHE_FILE = "demo_cache.parquet"
+    DATASET_ID = "sample_data_v1"
     
-    # Create a scenario where id_base + name_base is unique, but individually not.
-    # And where other combinations might be "almost" unique.
-    data["combined_key_part1"] = [i // 10 for i in range(1000)]
-    data["combined_key_part2"] = [i % 10 for i in range(1000)]
-
-    df_large = pl.DataFrame(data)
-
-    print("Original DataFrame (partial view):")
-    print(df_large.head())
-    print(f"Total rows: {df_large.height}\n")
-
-    # Experiment with different top_n_to_carry_over values
-    # A smaller number prunes more aggressively, but might miss the true key if it's
-    # built from "less unique" initial columns.
-    # A larger number retains more options, but reduces the pruning benefit.
-
-    # Example 1: Strict pruning (top 2)
-    print("\n--- Running with top_n_to_carry_over = 2 ---")
-    most_unique_cols_1, unique_count_1 = find_most_unique_column_combination_progressive(
-        df_large, top_n_to_carry_over=2
-    )
-    print(f"\nResult (top_n=2):")
-    print(f"Most unique column combination: {most_unique_cols_1}")
-    print(f"Number of unique rows with this combination: {unique_count_1}")
-
-    # Example 2: More relaxed pruning (top 5)
-    print("\n--- Running with top_n_to_carry_over = 5 ---")
-    most_unique_cols_2, unique_count_2 = find_most_unique_column_combination_progressive(
-        df_large, top_n_to_carry_over=5
-    )
-    print(f"\nResult (top_n=5):")
-    print(f"Most unique column combination: {most_unique_cols_2}")
-    print(f"Number of unique rows with this combination: {unique_count_2}")
+    # Clean up previous cache file for a clean demonstration
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+        
+    print("="*50)
+    print("      RUNNING WITH STRICT PROGRESSIVE FILTERING")
+    print("="*50)
     
-    # Example 3: Finding a true unique key
-    df_true_unique = pl.DataFrame({
-        "A": [1,2,3,4,5],
-        "B": ["x","y","z","a","b"],
-        "C": [10,11,12,13,14]
-    })
-    print("\n--- Running on DataFrame with true unique key (top_n_to_carry_over = 3) ---")
-    most_unique_cols_true, unique_count_true = find_most_unique_column_combination_progressive(
-        df_true_unique, top_n_to_carry_over=3
+    # Use top_n_to_carry_over = 2 to see the pruning in action
+    most_unique_cols, unique_count = find_most_unique_column_combination_progressive(
+        df, dataset_name=DATASET_ID, top_n_to_carry_over=2, cache_path=CACHE_FILE
     )
-    print(f"\nResult (True Unique Key):")
-    print(f"Most unique column combination: {most_unique_cols_true}")
-    print(f"Number of unique rows with this combination: {unique_count_true}")
+    
+    print(f"\nMost unique column combination: {most_unique_cols}")
+    print(f"Number of unique rows: {unique_count}")
+
+    # Show the contents of the cache file
+    if os.path.exists(CACHE_FILE):
+        print("\n--- Final Cache Contents ---")
+        cached_data = pl.read_parquet(CACHE_FILE)
+        print(cached_data)
