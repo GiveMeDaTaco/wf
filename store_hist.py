@@ -14,20 +14,8 @@ CACHE_SCHEMA = {
 def parse_history_log(log_file_path: str) -> List[Tuple[List[str], int, float]]:
     """
     Parses a log file to extract column combinations and their uniqueness stats.
-
-    Args:
-        log_file_path (str): The path to the input .txt log file.
-
-    Returns:
-        List[Tuple[List[str], int, float]]: A list of parsed records.
-        Each record is a tuple containing (column_list, num_unique, unique_percentage).
     """
-    # Regex to capture the three key pieces of information:
-    # 1. (.*?)      - The comma-separated list of columns inside the brackets.
-    # 2. (\d+)       - The integer number of unique rows.
-    # 3. (\d+\.?\d*) - The float/integer percentage value inside the parentheses.
     pattern = re.compile(r"Testing \[(.*?)\][^\d]*(\d+) unique rows \((.*?)%\)")
-    
     parsed_records = []
     print(f"Reading history file: {log_file_path}")
 
@@ -36,20 +24,11 @@ def parse_history_log(log_file_path: str) -> List[Tuple[List[str], int, float]]:
             for line in f:
                 match = pattern.search(line)
                 if match:
-                    # Group 1: Column list as a string (e.g., "'id', 'name'")
                     column_str = match.group(1)
-                    # Clean up the string and split into a list
                     columns = [col.strip().strip("'\"") for col in column_str.split(',')]
-                    
-                    # Group 2: Number of unique rows
                     num_unique = int(match.group(2))
-                    
-                    # Group 3: Uniqueness percentage
                     percentage = float(match.group(3))
-                    
-                    # Store a tuple of the extracted data
                     parsed_records.append((sorted(columns), num_unique, percentage / 100.0))
-
     except FileNotFoundError:
         print(f"Error: The file '{log_file_path}' was not found.")
         return []
@@ -66,56 +45,52 @@ def preload_cache_from_history(
     """
     Parses a history log file and loads its data into the Parquet cache,
     handling duplicates with any existing cache data.
-
-    Args:
-        history_file_path (str): The path to the .txt log file.
-        cache_path (str): The path to the Parquet cache file to create or update.
-        historical_dataset_name (str): The name to assign to this dataset in the cache.
     """
-    # 1. Parse the raw text log file
     parsed_records = parse_history_log(history_file_path)
-
     if not parsed_records:
         print("No records to add to the cache. Exiting.")
         return
 
-    # 2. Convert parsed records to a Polars DataFrame
-    history_data = []
-    for columns, num_unique, unique_percentage in parsed_records:
-        history_data.append({
-            "dataset_name": historical_dataset_name,
-            "columns": columns,
-            "num_unique": num_unique,
-            "unique_percentage": unique_percentage,
-        })
+    # --- THIS IS THE CORRECTED SECTION ---
+    # 2. Convert parsed records to a Polars DataFrame using explicit Series
+    # This is more robust and guarantees the correct dtypes, preventing the 'Object' type error.
     
-    new_history_df = pl.DataFrame(history_data, schema=CACHE_SCHEMA)
+    # Unzip the list of tuples into separate lists for each column
+    columns_list, num_unique_list, unique_percentage_list = zip(*parsed_records)
 
-    # 3. Load existing cache if it exists
+    # Create the DataFrame from explicitly typed Polars Series
+    new_history_df = pl.DataFrame({
+        "dataset_name": pl.Series(
+            [historical_dataset_name] * len(columns_list), dtype=CACHE_SCHEMA["dataset_name"]
+        ),
+        "columns": pl.Series(
+            columns_list, dtype=CACHE_SCHEMA["columns"]
+        ),
+        "num_unique": pl.Series(
+            num_unique_list, dtype=CACHE_SCHEMA["num_unique"]
+        ),
+        "unique_percentage": pl.Series(
+            unique_percentage_list, dtype=CACHE_SCHEMA["unique_percentage"]
+        ),
+    })
+    # --- END OF CORRECTION ---
+
     if os.path.exists(cache_path):
         print(f"Loading existing cache from: {cache_path}")
         existing_cache_df = pl.read_parquet(cache_path)
-        
-        # 4. Combine new and existing data
-        # We place the existing data first, so it's kept during deduplication
         combined_df = pl.concat([existing_cache_df, new_history_df])
         
-        # 5. Remove duplicates, keeping the first occurrence
-        # This prevents overwriting existing entries with historical ones
+        # Remove duplicates, keeping the data already in the cache
         final_df = combined_df.unique(subset=["dataset_name", "columns"], keep="first")
-        
         num_added = len(final_df) - len(existing_cache_df)
         print(f"Added {num_added} new records to the existing cache.")
-
     else:
         print("No existing cache found. Creating a new one.")
         final_df = new_history_df
         print(f"Added {len(final_df)} new records to the new cache.")
 
-    # 6. Write the result back to the Parquet file
     final_df.write_parquet(cache_path)
     print(f"Cache successfully saved to: {cache_path}")
-
 
 # --- Example Usage ---
 if __name__ == "__main__":
