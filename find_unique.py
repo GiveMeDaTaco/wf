@@ -22,20 +22,8 @@ def find_most_unique_column_combination_progressive(
     total_rows = df.height
     all_columns = df.columns
 
-    # --- Caching Logic: Load and Prepare Cache ---
     try:
         cache_df = pl.read_parquet(cache_path)
-        
-        # --- ROBUSTNESS FIX ---
-        # Proactively cast the 'columns' column to the correct type upon loading.
-        # This makes the script resilient to any incorrectly typed cache files.
-        if cache_df.schema.get("columns") != CACHE_SCHEMA["columns"]:
-            print("Warning: Cache 'columns' column has incorrect type. Forcing cast...")
-            cache_df = cache_df.with_columns(
-                pl.col("columns").cast(CACHE_SCHEMA["columns"])
-            )
-        # --- END OF FIX ---
-            
     except FileNotFoundError:
         # If cache doesn't exist, create an empty DataFrame with the correct schema
         cache_df = pl.DataFrame(CACHE_SCHEMA)
@@ -48,7 +36,6 @@ def find_most_unique_column_combination_progressive(
         .iter_rows()
     }
     print(f"Found {len(existing_results)} cached results for this dataset.")
-    # (The rest of the function remains exactly the same as before)
     
     stage_results: List[Tuple[int, frozenset]] = []
     overall_best_combination = []
@@ -83,6 +70,7 @@ def find_most_unique_column_combination_progressive(
             else:
                 num_unique = df.select(pl.struct(combo_key).n_unique()).item()
                 unique_percentage = num_unique / total_rows if total_rows > 0 else 0.0
+                # Add a tuple of results to the list
                 new_cache_entries.append(
                     (dataset_name, list(combo_key), num_unique, unique_percentage)
                 )
@@ -99,12 +87,27 @@ def find_most_unique_column_combination_progressive(
 
         print(f"Processed {len(current_stage_candidates)} combinations. ({hits_from_cache} from cache)")
 
+        # --- THIS IS THE CORRECTED SECTION ---
         if new_cache_entries:
             print(f"Adding {len(new_cache_entries)} new results to cache...")
-            new_rows_df = pl.DataFrame(new_cache_entries, schema=CACHE_SCHEMA)
+            
+            # Unzip the list of tuples into separate lists for each future column
+            dataset_names, columns_lists, nums_unique, pcts_unique = zip(*new_cache_entries)
+
+            # Create a new DataFrame from a dictionary of explicit, typed Series.
+            # This is the robust way to prevent the 'Object' dtype error.
+            new_rows_df = pl.DataFrame({
+                "dataset_name": pl.Series(dataset_names, dtype=CACHE_SCHEMA["dataset_name"]),
+                "columns": pl.Series(columns_lists, dtype=CACHE_SCHEMA["columns"]),
+                "num_unique": pl.Series(nums_unique, dtype=CACHE_SCHEMA["num_unique"]),
+                "unique_percentage": pl.Series(pcts_unique, dtype=CACHE_SCHEMA["unique_percentage"]),
+            })
+
+            # Now concatenate and save
             cache_df = pl.concat([cache_df, new_rows_df])
             cache_df.write_parquet(cache_path)
             print("Cache saved to disk.")
+        # --- END OF CORRECTION ---
 
         if overall_max_unique_rows == total_rows:
             print("\nFound a combination that uniquely identifies all rows.")
