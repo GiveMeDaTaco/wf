@@ -4,7 +4,7 @@ from typing import List, Tuple, Dict
 import os
 import time
 
-# Define the schema for the cache to ensure consistency
+# Define the schema for the cache to ensure consistency with the main script
 CACHE_SCHEMA = {
     "dataset_name": pl.Utf8,
     "columns": pl.List(pl.Utf8),
@@ -12,109 +12,81 @@ CACHE_SCHEMA = {
     "unique_percentage": pl.Float64,
 }
 
-def find_most_unique_column_combination_progressive(
-    df: pl.DataFrame,
-    dataset_name: str,
-    top_n_to_carry_over: int = 5,
-    cache_path: str = "uniqueness_cache.parquet"
-) -> Tuple[List[str], int]:
-    
-    total_rows = df.height
-    all_columns = df.columns
+def parse_history_log(log_file_path: str) -> List[Tuple[List[str], int, float]]:
+    """
+    Parses a log file to extract column combinations and their uniqueness stats.
+    """
+    pattern = re.compile(r"Testing \[(.*?)\][^\d]*(\d+) unique rows \((.*?)%\)")
+    parsed_records = []
+    print(f"Reading history file: {log_file_path}")
 
-    # --- Caching Logic: Load and Prepare Cache ---
     try:
-        cache_df = pl.read_parquet(cache_path)
-        
-        # --- ROBUSTNESS FIX ---
-        # Proactively cast the 'columns' column to the correct type upon loading.
-        # This makes the script resilient to any incorrectly typed cache files.
-        if cache_df.schema.get("columns") != CACHE_SCHEMA["columns"]:
-            print("Warning: Cache 'columns' column has incorrect type. Forcing cast...")
-            cache_df = cache_df.with_columns(
-                pl.col("columns").cast(CACHE_SCHEMA["columns"])
-            )
-        # --- END OF FIX ---
-            
+        with open(log_file_path, 'r') as f:
+            for line in f:
+                match = pattern.search(line)
+                if match:
+                    column_str = match.group(1)
+                    columns = [col.strip().strip("'\"") for col in column_str.split(',')]
+                    num_unique = int(match.group(2))
+                    percentage = float(match.group(3))
+                    parsed_records.append((sorted(columns), num_unique, percentage / 100.0))
     except FileNotFoundError:
-        # If cache doesn't exist, create an empty DataFrame with the correct schema
-        cache_df = pl.DataFrame(CACHE_SCHEMA)
+        print(f"Error: The file '{log_file_path}' was not found.")
+        return []
+        
+    print(f"Successfully parsed {len(parsed_records)} records from the log file.")
+    return parsed_records
 
-    print(f"Loading cache for dataset '{dataset_name}'...")
-    existing_results: Dict[tuple, Tuple[int, float]] = {
-        tuple(row[0]): (row[1], row[2])
-        for row in cache_df.filter(pl.col("dataset_name") == dataset_name)
-        .select(["columns", "num_unique", "unique_percentage"])
-        .iter_rows()
-    }
-    print(f"Found {len(existing_results)} cached results for this dataset.")
-    # (The rest of the function remains exactly the same as before)
+
+def preload_cache_from_history(
+    history_file_path: str,
+    cache_path: str,
+    historical_dataset_name: str
+):
+    """
+    Parses a history log file and loads its data into the Parquet cache,
+    handling duplicates with any existing cache data.
+    """
+    parsed_records = parse_history_log(history_file_path)
+    if not parsed_records:
+        print("No records to add to the cache. Exiting.")
+        return
+
+    columns_list, num_unique_list, unique_percentage_list = zip(*parsed_records)
+
+    new_history_df = pl.DataFrame({
+        "dataset_name": pl.Series([historical_dataset_name] * len(columns_list), dtype=CACHE_SCHEMA["dataset_name"]),
+        "columns": pl.Series(columns_list, dtype=CACHE_SCHEMA["columns"]),
+        "num_unique": pl.Series(num_unique_list, dtype=CACHE_SCHEMA["num_unique"]),
+        "unique_percentage": pl.Series(unique_percentage_list, dtype=CACHE_SCHEMA["unique_percentage"]),
+    })
+
+    if os.path.exists(cache_path):
+        print(f"Loading existing cache from: {cache_path}")
+        existing_cache_df = pl.read_parquet(cache_path)
+        combined_df = pl.concat([existing_cache_df, new_history_df])
+        final_df = combined_df.unique(subset=["dataset_name", "columns"], keep="first")
+        num_added = len(final_df) - len(existing_cache_df)
+        print(f"Added {num_added} new records to the existing cache.")
+    else:
+        print("No existing cache found. Creating a new one.")
+        final_df = new_history_df
+        print(f"Added {len(final_df)} new records to the new cache.")
+
+    # --- ROBUSTNESS FIX ---
+    # Explicitly cast the 'columns' column to the correct type before saving.
+    # This guards against any previous operation (like .unique()) changing the dtype to Object.
+    print("\nSchema BEFORE final cast:")
+    print(final_df.schema)
     
-    stage_results: List[Tuple[int, frozenset]] = []
-    overall_best_combination = []
-    overall_max_unique_rows = 0
+    final_df = final_df.with_columns(
+        pl.col("columns").cast(CACHE_SCHEMA["columns"])
+    )
+    
+    print("\nSchema AFTER final cast (this will be written to disk):")
+    print(final_df.schema)
+    # --- END OF FIX ---
 
-    for r in range(1, len(all_columns) + 1):
-        print(f"\n--- Checking combinations of length {r} ---")
-        current_stage_candidates: List[List[str]] = []
-        checked_combinations_this_stage: set[frozenset] = set()
-        new_cache_entries = []
-
-        if r == 1:
-            current_stage_candidates = [[col] for col in all_columns]
-        else:
-            for _, prev_combo_frozenset in stage_results:
-                for col in all_columns:
-                    if col not in prev_combo_frozenset:
-                        new_combo = sorted(list(prev_combo_frozenset) + [col])
-                        new_combo_frozenset = frozenset(new_combo)
-                        if new_combo_frozenset not in checked_combinations_this_stage:
-                            current_stage_candidates.append(new_combo)
-                            checked_combinations_this_stage.add(new_combo_frozenset)
-        
-        current_stage_metrics = []
-        hits_from_cache = 0
-        for combo_names_list in current_stage_candidates:
-            combo_key = tuple(sorted(combo_names_list))
-
-            if combo_key in existing_results:
-                num_unique, _ = existing_results[combo_key]
-                hits_from_cache += 1
-            else:
-                num_unique = df.select(pl.struct(combo_key).n_unique()).item()
-                unique_percentage = num_unique / total_rows if total_rows > 0 else 0.0
-                new_cache_entries.append(
-                    (dataset_name, list(combo_key), num_unique, unique_percentage)
-                )
-                existing_results[combo_key] = (num_unique, unique_percentage)
-
-            current_stage_metrics.append((num_unique, frozenset(combo_key)))
-
-            if num_unique > overall_max_unique_rows:
-                overall_max_unique_rows = num_unique
-                overall_best_combination = list(combo_key)
-
-            if overall_max_unique_rows == total_rows:
-                break
-
-        print(f"Processed {len(current_stage_candidates)} combinations. ({hits_from_cache} from cache)")
-
-        if new_cache_entries:
-            print(f"Adding {len(new_cache_entries)} new results to cache...")
-            new_rows_df = pl.DataFrame(new_cache_entries, schema=CACHE_SCHEMA)
-            cache_df = pl.concat([cache_df, new_rows_df])
-            cache_df.write_parquet(cache_path)
-            print("Cache saved to disk.")
-
-        if overall_max_unique_rows == total_rows:
-            print("\nFound a combination that uniquely identifies all rows.")
-            return overall_best_combination, overall_max_unique_rows
-
-        current_stage_metrics.sort(key=lambda x: x[0], reverse=True)
-        stage_results = current_stage_metrics[:top_n_to_carry_over]
-        
-        if not stage_results:
-            print("\nStopping early as no further improvements were found in the top N candidates.")
-            break
-
+    final_df.write_parquet(cache_path)
+    print(f"\nCache successfully saved to: {cache_path}")
     return overall_best_combination, overall_max_unique_rows
